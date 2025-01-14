@@ -1,0 +1,7 @@
+(function () {
+    let m = document.getElementsByTagName("script")[0].innerHTML.match(/window\.location\.href\s*=\s*["']boxlogin:\/\/login\?([^"']+)["']/);
+    if(m) {
+        let query = m[1];
+        location.href = "http://127.0.0.1:53682/?" + query;
+    }
+})();
