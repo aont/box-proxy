@@ -6,8 +6,8 @@ Proxy for using the Android Box app ID with `rclone`
 - プロクシを起動 `box_proxy.py`  
   Start the proxy using `box_proxy.py`.  
 
-- `rclone` にboxのclient id, client secretをセットし、oauth用のURLをこのプロクシにセット  
-  Configure rclone with the Box client ID and client secret, and set the OAuth URL to this proxy.  
+- `rclone` にboxのclient id, client secretをセット 
+  Configure rclone with the Box client ID and client secret 
 
 - boxの認証を進める  
   Proceed with Box authentication.  
