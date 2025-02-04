@@ -14,7 +14,7 @@ def find_free_port():
         return s.getsockname()[1]
 
 box_device_id_key = "box_device_id"
-box_device_id_value = "random device id"
+box_device_id_value = "7e99dafd7a5ffa309d82113cc05360e808cb679b5a8720d55769516ef2c20f3a"
 redirect_uri_key = "redirect_uri"
 redirect_uri_value = "boxlogin://login"
 section_name_list = ("share", "data")
@@ -95,16 +95,13 @@ async def setup_runner():
     config = configparser.ConfigParser()
     config.read(rclone_config_path)
 
-    for section_name in section_name_list:
-        if section_name in config:
-            config[section_name]["auth_url"] = f"http://127.0.0.1:{port}/authorize"
-            config[section_name]["token_url"] = f"http://127.0.0.1:{port}/token"
+    for section in config.sections():
+        if config.get(section, 'type', fallback='') == 'box':
+            config[section]["auth_url"] = f"http://127.0.0.1:{port}/authorize"
+            config[section]["token_url"] = f"http://127.0.0.1:{port}/token"
 
-            with open(rclone_config_path, "w") as configfile:
-                config.write(configfile)
-        else:
-            sys.stderr.write("[error] share not found\n")
-            raise Exception()
+    with open(rclone_config_path, "w") as configfile:
+            config.write(configfile)
 
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
