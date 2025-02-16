@@ -4,7 +4,6 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import http.client
-import socket
 import subprocess
 import wsgiref.simple_server # make_server
 
@@ -133,22 +132,24 @@ def update_rclone_config(port):
             if box_section_name is None:
                 box_section_name = "box"
         box_section_name_list.append(box_section_name)
-    
+
+    rclone_config_update_args = (
+        "type", "box",
+        "client_id", oath_client_id,
+        "client_secret", oauth_client_secret,
+        "auth_url", f"http://127.0.0.1:{port}/authorize",
+        "token_url", f"http://127.0.0.1:{port}/token",
+    )
+
     # 各 box セクションに対して rclone の設定を更新する
     for box_section_name in box_section_name_list:
-        rclone_config_update_args = [
-            "rclone", "config", "update", "--non-interactive",
-            box_section_name,
-            "type", "box",
-            "client_id", oath_client_id,
-            "client_secret", oauth_client_secret,
-            "auth_url", f"http://127.0.0.1:{port}/authorize",
-            "token_url", f"http://127.0.0.1:{port}/token",
-        ]
-        # sys.stderr.write(f"Running: {' '.join(rclone_config_update_args)}\n")
         try:
             proc = subprocess.run(
-                rclone_config_update_args,
+                tuple((
+                    "rclone", "config", "update",
+                    "--non-interactive", box_section_name,
+                    *rclone_config_update_args,
+                )),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True
