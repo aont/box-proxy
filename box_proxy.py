@@ -9,10 +9,10 @@ import subprocess
 import wsgiref.simple_server # make_server
 
 # 定数
-oath_client_id = "XXXX"
-oauth_client_secret = "YYYY"
+oath_client_id = "1y4ddq8mohgjyat6767yda5zca9ytxu3"
+oauth_client_secret = "H7aF3eXr4KxoomlFKiFx8HRheBBlfYlo"
 box_device_id_key = "box_device_id"
-box_device_id_value = "" # empty may be ok
+box_device_id_value = "7e99dafd7a5ffa309d82113cc05360e808cb679b5a8720d55769516ef2c20f3a"
 redirect_uri_key = "redirect_uri"
 redirect_uri_value = "boxlogin://login"
 
@@ -174,11 +174,10 @@ def update_rclone_config(port):
     # 正常終了時は None を返す
 
 def main():
-    port = find_free_port()
+    httpd = wsgiref.simple_server.make_server("0.0.0.0", 0, app)
     sys.stderr.write("[info] updating rclone config\n")
-    update_rclone_config(port)
-    sys.stderr.write(f"[info] Server running on port {port}\n")
-    httpd = wsgiref.simple_server.make_server("0.0.0.0", port, app)
+    update_rclone_config(httpd.server_port)
+    sys.stderr.write(f"[info] Server running on port {httpd.server_port}\n")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
