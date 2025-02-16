@@ -16,11 +16,6 @@ box_device_id_value = "7e99dafd7a5ffa309d82113cc05360e808cb679b5a8720d55769516ef
 redirect_uri_key = "redirect_uri"
 redirect_uri_value = "boxlogin://login"
 
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
-
 def parse_qs_flat(qs):
     """parse_qs() は各値がリストになるので、先頭要素のみ取り出す"""
     parsed = urllib.parse.parse_qs(qs)
