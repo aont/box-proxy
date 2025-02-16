@@ -13,8 +13,10 @@ def find_free_port():
         s.bind(('', 0))
         return s.getsockname()[1]
 
+oath_client_id = ""
+oauth_client_secret = ""
 box_device_id_key = "box_device_id"
-box_device_id_value = "7e99dafd7a5ffa309d82113cc05360e808cb679b5a8720d55769516ef2c20f3a"
+box_device_id_value = ""
 redirect_uri_key = "redirect_uri"
 redirect_uri_value = "boxlogin://login"
 section_name_list = ("share", "data")
@@ -58,27 +60,70 @@ async def handle(request):
     else:
         return aiohttp.web.Response(content_type="text/plain", body="hello")
 
-async def get_rclone_config_path():
+async def update_rclone_config(port):
     process = await asyncio.create_subprocess_exec(
-        "rclone", "config", "file",
+        "rclone", "config", "dump",
         stdout=asyncio.subprocess.PIPE,
     )
-    stdout = (await process.communicate())[0]
-    # print(stdout)
+    return_text = await process.stdout.read()
+    returncode = await process.wait()
 
-    if process.returncode != 0:
-        sys.stderr.write(f"[error] {stderr.decode().strip()}\n")
+    if returncode != 0:
+        sys.stderr.write(f"[error] {return_text.decode().strip()}\n")
         return None
 
-    output = stdout.decode().strip()
+    output = return_text.decode().strip()
+    rclone_config: dict = json.loads(output)
+
+    box_section_name_list = []
+    for section_name, preferences in rclone_config.items():
+        preferences: dict
+        if preferences.get('type') == 'box':
+            box_section_name_list.append(section_name)
     
-    match = re.search(r"Configuration file is stored at:\s*(.*)", output)
+    if len(box_section_name_list) == 0:
+        box_section_name = "box"
+        box_section_num = 0
+        if not f"box{box_section_num}" in rclone_config:
+            while True:
+                box_section_name = f"box{box_section_num}"
+                if box_section_name in rclone_config:
+                    break
+        box_section_name_list.append(box_section_name)
 
-    if match:
-        return match.group(1)
-    else:
-        sys.stderr.write("[error] Failed to parse rclone config path.\n")
-        return None
+    
+    for box_section_name in box_section_name_list:
+        rclone_config_update_args = ["rclone", "config", "update", "--non-interactive"]
+
+        rclone_config_update_args.append(box_section_name)
+        
+        rclone_config_update_args.append("type")
+        rclone_config_update_args.append("box")
+
+        rclone_config_update_args.append("client_id")
+        rclone_config_update_args.append(oath_client_id)
+
+        rclone_config_update_args.append("client_secret")
+        rclone_config_update_args.append(oauth_client_secret)
+
+        rclone_config_update_args.append("auth_url")
+        rclone_config_update_args.append(f"http://127.0.0.1:{port}/authorize")
+
+        rclone_config_update_args.append("token_url")
+        rclone_config_update_args.append(f"http://127.0.0.1:{port}/token")
+
+        process = await asyncio.create_subprocess_exec(
+            *rclone_config_update_args,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        # stdout = (await process.communicate())[0]
+        return_text = await process.stdout.read()
+        return_obj = json.loads(return_text)
+        returncode = await process.wait()
+        if not (not return_obj.get("Error") and returncode == 0):
+            sys.stderr.write(f"[error] {return_text=}\n")
+            sys.stderr.write(f"[error] {returncode=}\n")
+            raise Exception()
 
 async def setup_runner():
     app = aiohttp.web.Application()
@@ -88,20 +133,9 @@ async def setup_runner():
     await runner.setup()
 
     port = find_free_port()
-    # port = 8080
 
-    rclone_config_path = await get_rclone_config_path()
-
-    config = configparser.ConfigParser()
-    config.read(rclone_config_path)
-
-    for section in config.sections():
-        if config.get(section, 'type', fallback='') == 'box':
-            config[section]["auth_url"] = f"http://127.0.0.1:{port}/authorize"
-            config[section]["token_url"] = f"http://127.0.0.1:{port}/token"
-
-    with open(rclone_config_path, "w") as configfile:
-            config.write(configfile)
+    sys.stderr.write(f"[info] updating rclone config\n")
+    await update_rclone_config(port)
 
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

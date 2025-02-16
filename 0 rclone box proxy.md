@@ -6,10 +6,7 @@ Proxy for using the Android Box app ID with `rclone`
 - プロクシを起動 `box_proxy.py`  
   Start the proxy using `box_proxy.py`.  
 
-- `rclone` にboxのclient id, client secretをセット 
-  Configure rclone with the Box client ID and client secret 
-
-- boxの認証を進める  
+- `rclone config` からboxの認証を進める  
   Proceed with Box authentication.  
 
 - 認証が完了し、白い画面で止まったら `box_redirect.js` で、`rclone` が内部で立ち上げているHTTPサーバーにcodeを送る  
