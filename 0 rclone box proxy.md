@@ -1,7 +1,7 @@
 # rclone box proxy
 
-`rclone` でAndroidのBoxアプリのIDを使うためのプロキシ  
-Proxy for using the Android Box app ID with `rclone`  
+`rclone` でboxに接続する際に一部データを編集するプロキシ  
+A proxy that modifies some data when connecting to Box using `rclone`.
 
 - プロクシを起動 `box_proxy.py`  
   Start the proxy using `box_proxy.py`.  
