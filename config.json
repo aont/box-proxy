@@ -1,0 +1,6 @@
+{
+    "client_id": "XXXX",
+    "client_secret": "YYYY",
+    "device_id": "",
+    "redirect_uri": "boxlogin://login"
+}
