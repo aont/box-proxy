@@ -13,12 +13,18 @@ Box OAuth の /authorize, /token を仲介するミニサーバを aiohttp で�
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import base64
 import json
 import logging
 import socket
+import subprocess
+import sys
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from aiohttp import ClientSession, web
@@ -29,6 +35,13 @@ BOX_AUTHORIZE_URL = "https://account.box.com/api/oauth2/authorize"
 BOX_TOKEN_URL = "https://api.box.com/oauth2/token"
 FORM_CT = "application/x-www-form-urlencoded"
 MAX_LOG_BYTES = 2000  # レスポンスボディのログを過度に膨らませないための上限
+
+STATE_DIR = Path.home() / ".box_proxy"
+PORT_FILE = STATE_DIR / "port"
+APPLICATIONS_DIR = Path.home() / ".local/share/applications"
+DESKTOP_FILE_NAME = "box-proxy-boxlogin.desktop"
+DESKTOP_FILE_PATH = APPLICATIONS_DIR / DESKTOP_FILE_NAME
+DEFAULT_CONFIG_PATH = Path("config.json")
 
 
 # === 設定 =====================================================================
@@ -53,6 +66,31 @@ class AppConfig:
 
 
 # === ユーティリティ ============================================================
+
+
+def ensure_state_dir() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def save_port(port: int) -> None:
+    ensure_state_dir()
+    PORT_FILE.write_text(f"{port}\n", encoding="utf-8")
+
+
+def load_port() -> int:
+    try:
+        value = PORT_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as exc:
+        raise RuntimeError("Port information not found. Run the 'serve' command first.") from exc
+
+    if not value:
+        raise RuntimeError("Port information file is empty. Run the 'serve' command again.")
+
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError("Invalid port value stored. Run the 'serve' command again.") from exc
+
 
 def setup_logging() -> None:
     logging.basicConfig(
@@ -272,6 +310,8 @@ async def serve(app: web.Application, host: str = "0.0.0.0") -> None:
     sock.listen(128)
     sock.setblocking(False)
     port = sock.getsockname()[1]
+    save_port(port)
+    logging.info("[info] saved port=%s to %s", port, PORT_FILE)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -291,14 +331,207 @@ async def serve(app: web.Application, host: str = "0.0.0.0") -> None:
         await runner.cleanup()
 
 
-def main() -> None:
-    setup_logging()
-    config = AppConfig.from_file("config.json")
+# === CLI サポート =============================================================
+
+
+def build_authorize_payload(port: int, config: AppConfig) -> str:
+    payload = {
+        "auth_url": f"http://127.0.0.1:{port}/authorize",
+        "client_id": config.client_id,
+        "client_secret": config.client_secret,
+        "token_url": f"http://127.0.0.1:{port}/token",
+    }
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+def parse_token_from_output(text: str) -> str:
+    ptfiyrm = "Paste the following into your remote machine --->"
+    ep = "<---End paste"
+    start = text.find(ptfiyrm)
+    end = text.rfind(ep)
+    if start == -1 or end == -1 or end < start:
+        raise RuntimeError("Failed to parse token information from rclone output.")
+
+    b64_text = text[start + len(ptfiyrm) : end].strip()
+    pad = (4 - (len(b64_text) % 4)) % 4
+    b64_text += "=" * pad
+    print(b64_text)
+    return json.loads(base64.b64decode(b64_text))["token"]
+
+
+def run_rclone_authorize(port: int, config: AppConfig) -> str:
+    payload = build_authorize_payload(port, config)
+    cmd = ["rclone", "authorize", "box", payload]
+    logging.info("[info] running command: %s", " ".join(cmd))
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        logging.error(proc.stderr.strip())
+        raise RuntimeError("rclone authorize command failed")
+
+    logging.info(proc.stdout)
+    return parse_token_from_output(proc.stdout)
+
+
+def create_rclone_config_entry(name: str, port: int, config: AppConfig, token_json: str) -> None:
+    cmd = [
+        "rclone",
+        "config",
+        "create",
+        "--non-interactive",
+        name,
+        "box",
+        "client_id",
+        config.client_id,
+        "client_secret",
+        config.client_secret,
+        "auth_url",
+        f"http://127.0.0.1:{port}/authorize",
+        "token_url",
+        f"http://127.0.0.1:{port}/token",
+        "token",
+        token_json,
+    ]
+    logging.info("[info] running command: %s", " ".join(cmd[:-1] + ["<token-json>"]))
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        logging.error(proc.stderr.strip())
+        raise RuntimeError("rclone config create failed")
+
+    logging.debug(proc.stdout)
+
+
+def register_boxlogin_handler(script_path: Path) -> None:
+    if sys.platform.startswith("linux"):
+        APPLICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+        desktop_entry = """[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Box Proxy boxlogin handler
+Exec={exec_path} {script} _boxlogin %u
+NoDisplay=true
+MimeType=x-scheme-handler/boxlogin;
+""".format(exec_path=sys.executable, script=script_path)
+        DESKTOP_FILE_PATH.write_text(desktop_entry, encoding="utf-8")
+        logging.info("[info] registered desktop entry at %s", DESKTOP_FILE_PATH)
+        try:
+            subprocess.run(
+                [
+                    "xdg-mime",
+                    "default",
+                    DESKTOP_FILE_NAME,
+                    "x-scheme-handler/boxlogin",
+                ],
+                check=True,
+            )
+            logging.info("[info] associated boxlogin scheme via xdg-mime")
+        except FileNotFoundError:
+            logging.warning("xdg-mime not found; please register the boxlogin handler manually if necessary.")
+        except subprocess.CalledProcessError as exc:
+            logging.warning("xdg-mime returned non-zero exit status: %s", exc)
+    elif sys.platform.startswith("win"):
+        try:
+            import winreg
+        except ImportError:
+            logging.warning("winreg module not available; cannot register boxlogin handler automatically.")
+            return
+
+        command = f'"{sys.executable}" "{script_path}" _boxlogin "%1"'
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\\Classes\\boxlogin") as key:
+                winreg.SetValueEx(key, None, 0, winreg.REG_SZ, "URL:boxlogin Protocol")
+                winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+            with winreg.CreateKey(
+                winreg.HKEY_CURRENT_USER, r"Software\\Classes\\boxlogin\\shell\\open\\command"
+            ) as cmd_key:
+                winreg.SetValueEx(cmd_key, None, 0, winreg.REG_SZ, command)
+            logging.info("[info] registered boxlogin handler in Windows registry")
+        except OSError as exc:
+            logging.warning("Failed to register boxlogin handler in Windows registry: %s", exc)
+    else:
+        logging.warning(
+            "Automatic boxlogin handler registration is not supported on this platform (%s).",
+            sys.platform,
+        )
+
+
+def command_serve(args: argparse.Namespace) -> None:
+    config = AppConfig.from_file(args.config)
     app = create_app(config)
     try:
-        asyncio.run(serve(app))
+        asyncio.run(serve(app, host=args.host))
     except KeyboardInterrupt:
         logging.info("Server interrupted, shutting down.")
+
+
+def command_authorize(args: argparse.Namespace) -> None:
+    config = AppConfig.from_file(args.config)
+    port = load_port()
+    register_boxlogin_handler(Path(__file__).resolve())
+    token_json = run_rclone_authorize(port, config)
+    logging.info("[info] received token from rclone authorize")
+    create_rclone_config_entry(args.boxentryname, port, config, token_json)
+    logging.info("[info] rclone configuration updated for entry '%s'", args.boxentryname)
+
+
+def command_boxlogin(args: argparse.Namespace) -> None:
+    # port = load_port()
+    port = 53682
+    url = urllib.parse.urlparse(args.url)
+    if url.scheme != "boxlogin":
+        raise RuntimeError("Invalid scheme for _boxlogin handler")
+
+    query = url.query
+    target = f"http://127.0.0.1:{port}/?{query}"
+
+    logging.info("[info] forwarding boxlogin callback to %s", target)
+    request = urllib.request.Request(target, method="GET")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        logging.info("[info] forwarded with status %s", response.status)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Box proxy utility")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+
+    serve_parser = subparsers.add_parser("serve", help="Start the proxy server")
+    serve_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Host address to bind")
+    serve_parser.set_defaults(func=command_serve)
+
+    authorize_parser = subparsers.add_parser("authorize", help="Run rclone box authorization helper")
+    authorize_parser.add_argument("boxentryname", help="rclone config entry name to create")
+    authorize_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to config.json")
+    authorize_parser.set_defaults(func=command_authorize)
+
+    boxlogin_parser = subparsers.add_parser("_boxlogin", help="Internal handler for boxlogin scheme")
+    boxlogin_parser.add_argument("url", help="boxlogin URL provided by the browser")
+    boxlogin_parser.set_defaults(func=command_boxlogin)
+
+    return parser
+
+
+def main(argv: List[str] | None = None) -> None:
+    setup_logging()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except RuntimeError as exc:
+        logging.error("%s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
