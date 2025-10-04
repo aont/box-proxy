@@ -1,179 +1,305 @@
-import json
-import sys
-import urllib.parse
-import urllib.request
-import urllib.error
-import http.client
-import subprocess
-import wsgiref.simple_server # make_server
+# -*- coding: utf-8 -*-
+"""
+Box OAuth の /authorize, /token を仲介するミニサーバを aiohttp で実装。
+起動時に rclone の box リモートの設定 (client_id 等) をローカルの仲介URLに更新します。
 
-def parse_qs_flat(qs):
-    """parse_qs() は各値がリストになるので、先頭要素のみ取り出す"""
-    parsed = urllib.parse.parse_qs(qs)
+- GET  /authorize: クエリに device_id, redirect_uri を付与して Box の認可画面へ 302 リダイレクト
+- POST /token    : フォームに device_id, redirect_uri を付与して Box のトークンエンドポイントへ転送
+- GET  /         : 動作確認 (hello)
+- GET  /health   : ヘルスチェック (ok)
+
+依存: aiohttp
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import socket
+import urllib.parse
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+from aiohttp import ClientSession, web
+
+# === 定数 =====================================================================
+
+BOX_AUTHORIZE_URL = "https://account.box.com/api/oauth2/authorize"
+BOX_TOKEN_URL = "https://api.box.com/oauth2/token"
+FORM_CT = "application/x-www-form-urlencoded"
+MAX_LOG_BYTES = 2000  # レスポンスボディのログを過度に膨らませないための上限
+
+
+# === 設定 =====================================================================
+
+@dataclass(frozen=True)
+class AppConfig:
+    device_id: str
+    redirect_uri: str
+    client_id: str
+    client_secret: str
+
+    @staticmethod
+    def from_file(path: str) -> "AppConfig":
+        with open(path, "rb") as fp:
+            obj = json.load(fp)
+        return AppConfig(
+            device_id=obj["device_id"],
+            redirect_uri=obj["redirect_uri"],
+            client_id=obj["client_id"],
+            client_secret=obj["client_secret"],
+        )
+
+
+# === ユーティリティ ============================================================
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s: %(message)s",
+    )
+
+
+def parse_qs_first(qs: str) -> Dict[str, str]:
+    """
+    urllib.parse.parse_qs() は各値がリストになるので、先頭要素のみ取り出す。
+    例: "a=1&a=2" -> {"a": "1"}  （※元コードと同じ挙動）
+    """
+    parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
     return {k: v[0] for k, v in parsed.items()}
 
-def wsgi_app_factory(config):
-    def app(environ, start_response):
-        method = environ.get("REQUEST_METHOD", "")
-        path = environ.get("PATH_INFO", "")
-        query_string = environ.get("QUERY_STRING", "")
-        content_type = environ.get("CONTENT_TYPE", "")
-        sys.stderr.write(f"method={method} path={path} query_string={query_string} content_type={content_type}\n")
-        
-        if path == "/authorize":
-            if method != "GET":
-                start_response("405 Method Not Allowed", [("Content-Type", "text/plain")])
-                return [b"Method Not Allowed"]
-            query = parse_qs_flat(query_string)
-            sys.stderr.write(f"query original: {json.dumps(query)}\n")
-            # 必要なパラメータを追加
-            query["device_id"] = config["device_id"]
-            query["redirect_uri"] = config["redirect_uri"]
-            sys.stderr.write(f"query modified: {json.dumps(query)}\n")
-            new_query = urllib.parse.urlencode(query)
-            location = "https://account.box.com/api/oauth2/authorize?" + new_query
-            start_response("302 Found", [("Location", location)])
-            return [b""]
-        
-        elif path == "/token":
-            if method != "POST":
-                start_response("405 Method Not Allowed", [("Content-Type", "text/plain")])
-                return [b"Method Not Allowed"]
-            if content_type != "application/x-www-form-urlencoded":
-                start_response("400 Bad Request", [("Content-Type", "text/plain")])
-                return [b"Invalid Content-Type"]
-            try:
-                content_length = int(environ.get("CONTENT_LENGTH", "0"))
-            except (ValueError, TypeError):
-                content_length = 0
-            body = environ["wsgi.input"].read(content_length).decode("utf-8")
-            params = urllib.parse.parse_qs(body)
-            params = {k: v[0] for k, v in params.items()}
-            sys.stderr.write(f"param original: {json.dumps(params)}\n")
-            # 必要なパラメータを追加
-            params["device_id"] = config["device_id"]
-            params["redirect_uri"] = config["redirect_uri"]
-            sys.stderr.write(f"param modified: {json.dumps(params)}\n")
-            
-            # POST リクエスト用のデータ作成
-            post_data = urllib.parse.urlencode(params).encode("utf-8")
-            req = urllib.request.Request("https://api.box.com/oauth2/token", data=post_data, method="POST")
-            req.add_header("Content-Type", "application/x-www-form-urlencoded")
-            try:
-                with urllib.request.urlopen(req) as resp:
-                    status_code = resp.getcode()
-                    content = resp.read()
-                    resp_content_type = resp.headers.get("Content-Type", "application/octet-stream")
-            except urllib.error.HTTPError as e:
-                status_code = e.code
-                content = e.read()
-                resp_content_type = e.headers.get("Content-Type", "application/octet-stream")
-            except Exception as e:
-                sys.stderr.write(f"Error making POST request: {e}\n")
-                start_response("500 Internal Server Error", [("Content-Type", "text/plain")])
-                return [b"Internal Server Error"]
-            
-            sys.stderr.write(f"response.status_code={status_code}\n")
-            sys.stderr.write(f"response.content={content}\n")
-            reason = http.client.responses.get(status_code, "")
-            status_line = f"{status_code} {reason}"
-            start_response(status_line, [("Content-Type", resp_content_type)])
-            return [content]
-        
-        else:
-            start_response("200 OK", [("Content-Type", "text/plain")])
-            return [b"hello"]
-    return app
 
-def update_rclone_config(port, config):
+def parse_urlencoded_first(body: str) -> Dict[str, str]:
+    parsed = urllib.parse.parse_qs(body, keep_blank_values=True)
+    return {k: v[0] for k, v in parsed.items()}
+
+
+def is_form_urlencoded(content_type: str | None) -> bool:
+    if not content_type:
+        return False
+    return content_type.split(";", 1)[0].strip().lower() == FORM_CT
+
+
+def build_redirect(base: str, params: Dict[str, str]) -> str:
+    return f"{base}?{urllib.parse.urlencode(params)}"
+
+
+def log_request(req: web.Request) -> None:
+    logging.info(
+        "method=%s path=%s query_string=%s content_type=%s",
+        req.method,
+        req.path,
+        req.query_string,
+        req.headers.get("Content-Type", ""),
+    )
+
+
+def shorten_bytes(b: bytes, limit: int = MAX_LOG_BYTES) -> str:
+    s = b.decode(errors="replace")
+    return s if len(s) <= limit else s[:limit] + "...(truncated)"
+
+
+# === ハンドラ ================================================================
+
+class OAuthProxy:
+    def __init__(self, config: AppConfig):
+        self.config = config
+
+    async def authorize(self, request: web.Request) -> web.Response:
+        log_request(request)
+        original = parse_qs_first(request.query_string)
+        logging.debug("query original: %s", json.dumps(original, ensure_ascii=False))
+        modified = {
+            **original,
+            "device_id": self.config.device_id,
+            "redirect_uri": self.config.redirect_uri,
+        }
+        logging.debug("query modified: %s", json.dumps(modified, ensure_ascii=False))
+        location = build_redirect(BOX_AUTHORIZE_URL, modified)
+        raise web.HTTPFound(location)
+
+    async def token(self, request: web.Request) -> web.Response:
+        log_request(request)
+        content_type = request.headers.get("Content-Type", "")
+        if not is_form_urlencoded(content_type):
+            raise web.HTTPBadRequest(text="Invalid Content-Type")
+
+        # 元実装と同じく生ボディを読み、URLエンコードを自力で解釈して先頭値のみ採用
+        body_text = (await request.read()).decode("utf-8")
+        params = parse_urlencoded_first(body_text)
+        logging.debug("param original: %s", json.dumps(params, ensure_ascii=False))
+
+        # 必須パラメータを追加
+        params["device_id"] = self.config.device_id
+        params["redirect_uri"] = self.config.redirect_uri
+        logging.debug("param modified: %s", json.dumps(params, ensure_ascii=False))
+
+        session: ClientSession = request.app["http_client"]
+        try:
+            # aiohttp は dict を渡すと application/x-www-form-urlencoded で送信してくれる
+            async with session.post(
+                BOX_TOKEN_URL,
+                data=params,
+                headers={"Content-Type": FORM_CT},
+            ) as resp:
+                status = resp.status
+                content = await resp.read()
+                resp_ct = resp.headers.get("Content-Type", "application/octet-stream")
+        except Exception:
+            logging.exception("Error making POST request to Box")
+            raise web.HTTPInternalServerError(text="Internal Server Error")
+
+        logging.info("response.status_code=%s", status)
+        logging.debug("response.content=%s", shorten_bytes(content))
+        return web.Response(status=status, body=content, headers={"Content-Type": resp_ct})
+
+
+# === rclone 設定更新（非同期サブプロセス） ====================================
+
+async def _run(cmd: List[str]) -> Tuple[int, bytes, bytes]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout, stderr
+
+
+async def update_rclone_config(port: int, config: AppConfig) -> None:
     """
     rclone の設定を JSON で取得し、box タイプのセクションに対して
     client_id, client_secret, auth_url, token_url を更新する。
     """
+    rc, out, err = await _run(["rclone", "config", "dump"])
+    if rc != 0:
+        logging.error("[error] rclone config dump failed: %s", err.decode(errors="replace").strip())
+        return
+
     try:
-        proc = subprocess.run(
-            ["rclone", "config", "dump"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True
-        )
-    except subprocess.CalledProcessError as e:
-        sys.stderr.write(f"[error] rclone config dump failed: {e.stderr.decode().strip()}\n")
-        return None
-    output = proc.stdout.decode().strip()
-    try:
-        rclone_config = json.loads(output)
+        rclone_config = json.loads(out.decode())
     except json.JSONDecodeError as e:
-        sys.stderr.write(f"[error] JSON decode error: {e}\n")
-        return None
+        logging.error("[error] JSON decode error: %s", e)
+        return
 
     # box タイプのセクション名を収集
-    box_section_name_list = []
-    for section_name, preferences in rclone_config.items():
-        if isinstance(preferences, dict) and preferences.get("type") == "box":
-            box_section_name_list.append(section_name)
-    
-    # box セクションが存在しない場合、"box" または "box*" を利用
-    if not box_section_name_list:
-        if "box" in rclone_config:
-            box_section_name = "box"
-        else:
-            box_section_name = None
-            for key in rclone_config.keys():
-                if key.startswith("box"):
-                    box_section_name = key
-                    break
-            if box_section_name is None:
-                box_section_name = "box"
-        box_section_name_list.append(box_section_name)
+    box_sections: List[str] = [
+        name
+        for name, prefs in rclone_config.items()
+        if isinstance(prefs, dict) and prefs.get("type") == "box"
+    ]
 
-    rclone_config_update_args = (
-        "type", "box",
-        "client_id", config["client_id"],
-        "client_secret", config["client_secret"],
-        "auth_url", f"http://127.0.0.1:{port}/authorize",
-        "token_url", f"http://127.0.0.1:{port}/token",
-    )
+    # box セクションが存在しない場合、"box" または "box*" を利用
+    if not box_sections:
+        if "box" in rclone_config:
+            candidate = "box"
+        else:
+            candidate = next((k for k in rclone_config.keys() if k.startswith("box")), "box")
+        box_sections = [candidate]
+
+    update_args = [
+        "type",
+        "box",
+        "client_id",
+        config.client_id,
+        "client_secret",
+        config.client_secret,
+        "auth_url",
+        f"http://127.0.0.1:{port}/authorize",
+        "token_url",
+        f"http://127.0.0.1:{port}/token",
+    ]
 
     # 各 box セクションに対して rclone の設定を更新する
-    for box_section_name in box_section_name_list:
-        try:
-            proc = subprocess.run(
-                tuple((
-                    "rclone", "config", "update",
-                    "--non-interactive", box_section_name,
-                    *rclone_config_update_args,
-                )),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write(f"[error] rclone config update failed: {e.stderr.decode().strip()}\n")
-            raise Exception("rclone config update failed")
-        return_text = proc.stdout.decode()
-        try:
-            return_obj = json.loads(return_text)
-        except json.JSONDecodeError as e:
-            sys.stderr.write(f"[error] JSON decode error in update: {e}\n")
-            raise Exception("rclone config update JSON decode error")
-        if return_obj.get("Error") or proc.returncode != 0:
-            sys.stderr.write(f"[error] {return_text}\n")
-            sys.stderr.write(f"[error] return code: {proc.returncode}\n")
-            raise Exception("rclone config update error")
-    # 正常終了時は None を返す
+    for section in box_sections:
+        rc, out, err = await _run(
+            ["rclone", "config", "update", "--non-interactive", section, *update_args]
+        )
+        if rc != 0:
+            logging.error("[error] rclone config update failed: %s", err.decode(errors="replace").strip())
+            raise RuntimeError("rclone config update failed")
 
-def main():
-    with open("config.json", "rb") as fp:
-        config = json.load(fp)
-    httpd = wsgiref.simple_server.make_server("0.0.0.0", 0, wsgi_app_factory(config))
-    sys.stderr.write("[info] updating rclone config\n")
-    update_rclone_config(httpd.server_port, config)
-    sys.stderr.write(f"[info] Server running on port {httpd.server_port}\n")
+        text = out.decode()
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError as e:
+            logging.error("[error] JSON decode error in update: %s", e)
+            raise RuntimeError("rclone config update JSON decode error")
+
+        if obj.get("Error") or rc != 0:
+            logging.error("[error] %s", text)
+            logging.error("[error] return code: %s", rc)
+            raise RuntimeError("rclone config update error")
+
+    # 正常終了時は None を返す（そのまま終了）
+
+
+# === アプリ作成・起動 ==========================================================
+
+async def on_startup(app: web.Application):
+    app["http_client"] = ClientSession()
+
+
+async def on_cleanup(app: web.Application):
+    await app["http_client"].close()
+
+
+def create_app(config: AppConfig) -> web.Application:
+    app = web.Application()
+    app["config"] = config
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+
+    proxy = OAuthProxy(config)
+    app.add_routes(
+        [
+            web.get("/authorize", proxy.authorize),  # 405 は aiohttp が自動で返す
+            web.post("/token", proxy.token),
+            web.get("/", lambda req: web.Response(text="hello")),
+            web.get("/health", lambda req: web.Response(text="ok")),
+        ]
+    )
+    return app
+
+
+async def serve(app: web.Application, host: str = "0.0.0.0") -> None:
+    """
+    ポート 0 でバインドすると実際のポートが分かりづらいので、
+    先にソケットを自前でバインドしてポートを確定させる。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((host, 0))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.listen(128)
+    sock.setblocking(False)
+    port = sock.getsockname()[1]
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    # SockSite で事前に割り当てたソケットを使って起動
+    site = web.SockSite(runner, sock=sock)
+    await site.start()
+
+    logging.info("[info] updating rclone config")
+    await update_rclone_config(port, app["config"])
+    logging.info("[info] Server running on port %s", port)
+
     try:
-        httpd.serve_forever()
+        # サーバを走らせ続ける
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
+def main() -> None:
+    setup_logging()
+    config = AppConfig.from_file("config.json")
+    app = create_app(config)
+    try:
+        asyncio.run(serve(app))
     except KeyboardInterrupt:
-        sys.stderr.write("Server interrupted, shutting down.\n")
+        logging.info("Server interrupted, shutting down.")
+
 
 if __name__ == "__main__":
     main()
