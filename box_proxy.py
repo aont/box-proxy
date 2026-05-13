@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import logging
+import secrets
 import socket
 import subprocess
 import sys
@@ -55,10 +56,21 @@ class AppConfig:
 
     @staticmethod
     def from_file(path: str) -> "AppConfig":
-        with open(path, "rb") as fp:
+        config_path = Path(path)
+        with config_path.open("rb") as fp:
             obj = json.load(fp)
+
+        device_id = obj.get("device_id", "")
+        if isinstance(device_id, str) and device_id == "":
+            generated = secrets.token_urlsafe(24)
+            obj["device_id"] = generated
+            with config_path.open("w", encoding="utf-8") as fp:
+                json.dump(obj, fp, ensure_ascii=False, indent=4)
+                fp.write("\n")
+            device_id = generated
+
         return AppConfig(
-            device_id=obj["device_id"],
+            device_id=device_id,
             redirect_uri=obj["redirect_uri"],
             client_id=obj["client_id"],
             client_secret=obj["client_secret"],
